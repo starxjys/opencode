@@ -261,7 +261,15 @@ echo "  - Gateway token: $OPENCLAW_GATEWAY_TOKEN"
 echo "  - Tailscale exposure: Off"
 echo "  - Install Gateway daemon: No"
 echo ""
-docker compose "${COMPOSE_ARGS[@]}" run --rm openclaw-cli onboard --no-install-daemon
+
+# Sync token in config file with environment variable before onboarding
+# This ensures consistency when user chooses "Use existing values"
+if [[ -f "$OPENCLAW_CONFIG_DIR/openclaw.json" ]]; then
+  echo "==> Syncing gateway token in config file with environment variable"
+  docker compose "${COMPOSE_ARGS[@]}" run --rm openclaw-cli config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN" >/dev/null 2>&1 || true
+fi
+
+docker compose "${COMPOSE_ARGS[@]}" run --rm openclaw-cli onboard --no-install-daemon --token "$OPENCLAW_GATEWAY_TOKEN"
 
 echo ""
 echo "==> Provider setup (optional)"
