@@ -114,6 +114,40 @@ export function isLocalDirectRequest(req?: IncomingMessage, trustedProxies?: str
   return (hostIsLocal || hostIsTailscaleServe) && (!hasForwarded || remoteIsTrustedProxy);
 }
 
+/**
+ * Check if the request is coming from a Unix domain socket connection.
+ * Unix socket connections are considered local and trusted.
+ */
+export function isUnixSocketConnection(req?: IncomingMessage): boolean {
+  if (!req?.socket) {
+    return false;
+  }
+
+  const socket = req.socket as {
+    remoteAddress?: string;
+    remoteFamily?: string;
+    remotePort?: number;
+  };
+
+  // Unix socket connections have no remote address
+  if (socket.remoteAddress) {
+    return false;
+  }
+
+  // Unix socket connections have no remote port
+  if (socket.remotePort !== undefined) {
+    return false;
+  }
+
+  // On some systems, remoteFamily is set to 'unix'
+  if (socket.remoteFamily === "unix") {
+    return true;
+  }
+
+  // If no remote address and no remote port, it's likely a Unix socket
+  return true;
+}
+
 function getTailscaleUser(req?: IncomingMessage): TailscaleUser | null {
   if (!req) {
     return null;

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { OpenClawConfig } from "../config/config.js";
 import {
   loadConfig,
@@ -257,6 +259,24 @@ export async function callGateway<T = Record<string, unknown>>(
   };
   const formatTimeoutError = () =>
     `gateway timeout after ${timeoutMs}ms\n${connectionDetails.message}`;
+
+  // Try Unix socket for local connections (skip pairing)
+  let useUnixSocket = false;
+  let unixSocketPath: string | undefined;
+  if (!urlOverride && !isRemoteMode) {
+    const configDir = resolveStateDir(process.env);
+    const socketPath = path.join(configDir, "gateway.sock");
+    try {
+      const stats = await fs.stat(socketPath);
+      if (stats.isSocket()) {
+        useUnixSocket = true;
+        unixSocketPath = socketPath;
+      }
+    } catch {
+      // Unix socket not available, use TCP
+    }
+  }
+
   return await new Promise<T>((resolve, reject) => {
     let settled = false;
     let ignoreClose = false;
@@ -274,10 +294,10 @@ export async function callGateway<T = Record<string, unknown>>(
     };
 
     const client = new GatewayClient({
-      url,
+      url: useUnixSocket ? `ws+unix://${unixSocketPath}` : url,
       token,
       password,
-      tlsFingerprint,
+      tlsFingerprint: useUnixSocket ? undefined : tlsFingerprint,
       instanceId: opts.instanceId ?? randomUUID(),
       clientName: opts.clientName ?? GATEWAY_CLIENT_NAMES.CLI,
       clientDisplayName: opts.clientDisplayName,

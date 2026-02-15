@@ -1,4 +1,5 @@
 import type { Server as HttpServer } from "node:http";
+import fs from "node:fs/promises";
 import type { WebSocketServer } from "ws";
 import type { CanvasHostHandler, CanvasHostServer } from "../canvas-host/server.js";
 import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
@@ -29,6 +30,7 @@ export function createGatewayCloseHandler(params: {
   wss: WebSocketServer;
   httpServer: HttpServer;
   httpServers?: HttpServer[];
+  unixSocketPath?: string;
 }) {
   return async (opts?: { reason?: string; restartExpectedMs?: number | null }) => {
     const reasonRaw = typeof opts?.reason === "string" ? opts.reason.trim() : "";
@@ -123,6 +125,15 @@ export function createGatewayCloseHandler(params: {
       await new Promise<void>((resolve, reject) =>
         httpServer.close((err) => (err ? reject(err) : resolve())),
       );
+    }
+    
+    // Clean up Unix socket file
+    if (params.unixSocketPath) {
+      try {
+        await fs.unlink(params.unixSocketPath);
+      } catch {
+        /* ignore */
+      }
     }
   };
 }
