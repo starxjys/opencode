@@ -7,6 +7,7 @@ EXTRA_COMPOSE_FILE="$ROOT_DIR/docker-compose.extra.yml"
 IMAGE_NAME="${OPENCLAW_IMAGE:-openclaw:local}"
 EXTRA_MOUNTS="${OPENCLAW_EXTRA_MOUNTS:-}"
 HOME_VOLUME_NAME="${OPENCLAW_HOME_VOLUME:-}"
+DOCKERFILE="${OPENCLAW_DOCKERFILE:-Dockerfile}"
 
 fail() {
   echo "ERROR: $*" >&2
@@ -244,11 +245,11 @@ upsert_env "$ENV_FILE" \
   OPENCLAW_HOME_VOLUME \
   OPENCLAW_DOCKER_APT_PACKAGES
 
-echo "==> Building Docker image: $IMAGE_NAME"
+echo "==> Building Docker image: $IMAGE_NAME (using $DOCKERFILE)"
 docker build \
   --build-arg "OPENCLAW_DOCKER_APT_PACKAGES=${OPENCLAW_DOCKER_APT_PACKAGES}" \
   -t "$IMAGE_NAME" \
-  -f "$ROOT_DIR/Dockerfile" \
+  -f "$ROOT_DIR/$DOCKERFILE" \
   "$ROOT_DIR"
 
 echo ""
