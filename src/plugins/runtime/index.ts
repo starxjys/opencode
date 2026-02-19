@@ -1,5 +1,4 @@
 import { createRequire } from "node:module";
-import type { PluginRuntime } from "./types.js";
 import { resolveEffectiveMessagesConfig, resolveHumanDelayConfig } from "../../agents/identity.js";
 import { createMemoryGetTool, createMemorySearchTool } from "../../agents/tools/memory-tool.js";
 import { handleSlackAction } from "../../agents/tools/slack-actions.js";
@@ -139,6 +138,7 @@ import {
 } from "../../web/auth-store.js";
 import { loadWebMedia } from "../../web/media.js";
 import { formatNativeDependencyHint } from "./native-deps.js";
+import type { PluginRuntime } from "./types.js";
 
 let cachedVersion: string | null = null;
 
@@ -236,6 +236,27 @@ function loadWhatsAppActions() {
   return whatsappActionsPromise;
 }
 
+const RUNTIME_LEGACY_EXEC_DISABLED_ERROR =
+  "runtime.system.runCommandWithTimeout is disabled for security hardening. Use fixed-purpose runtime APIs instead.";
+
+function isLegacyPluginRuntimeExecEnabled(): boolean {
+  try {
+    return loadConfig().plugins?.runtime?.allowLegacyExec === true;
+  } catch {
+    // Fail closed if config is unreadable/invalid.
+    return false;
+  }
+}
+
+const runtimeCommandExecutionGuarded: PluginRuntime["system"]["runCommandWithTimeout"] = async (
+  ...args
+) => {
+  if (!isLegacyPluginRuntimeExecEnabled()) {
+    throw new Error(RUNTIME_LEGACY_EXEC_DISABLED_ERROR);
+  }
+  return await runCommandWithTimeout(...args);
+};
+
 export function createPluginRuntime(): PluginRuntime {
   return {
     version: resolveVersion(),
@@ -245,7 +266,7 @@ export function createPluginRuntime(): PluginRuntime {
     },
     system: {
       enqueueSystemEvent,
-      runCommandWithTimeout,
+      runCommandWithTimeout: runtimeCommandExecutionGuarded,
       formatNativeDependencyHint,
     },
     media: {

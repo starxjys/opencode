@@ -1,0 +1,71 @@
+# 阶段 1: 拿 Bun
+FROM oven/bun:latest AS bun-source
+
+# 阶段 2: 构建与运行环境
+FROM node:22-bookworm AS runner
+
+# 1. 替换 APT 为中科大(USTC)源
+RUN sed -i 's/http:\/\/deb.debian.org/https:\/\/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update
+
+# 2. 从第一阶段拷贝 Bun 并做软链接
+COPY --from=bun-source /usr/local/bin/bun /usr/local/bin/bun
+RUN ln -s /usr/local/bin/bun /usr/bin/bun
+
+# 3. 配置 pnpm 环境
+RUN corepack enable
+
+WORKDIR /app
+
+# 预先创建必要的目录并赋权给 node 用户
+# 这一步只针对空目录，速度极快
+RUN mkdir -p /home/node/.openclaw/agents /home/node/.openclaw/workspace && \
+    chown -R node:node /app /home/node
+
+# 4. 安装系统依赖 (如果有)
+ARG OPENCLAW_DOCKER_APT_PACKAGES=""
+RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
+      apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $OPENCLAW_DOCKER_APT_PACKAGES && \
+      apt-get clean && \
+      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
+    fi
+
+# 安装 UV
+COPY --from=ghcr.m.daocloud.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV UV_INDEX_URL=https://mirrors.volces.com/pypi/simple/
+ENV PIP_INDEX_URL=https://mirrors.volces.com/pypi/simple/
+RUN uv --version
+
+# --- 关键优化点：切换到 node 用户 ---
+USER node
+
+# Configure pnpm for node user with mirror and store path
+RUN pnpm config set registry https://registry.npmmirror.com && \
+    pnpm config set store-dir /home/node/.local/share/pnpm/store
+
+# 5. 拷贝配置文件 (利用 --chown 确保权限正确，无需后期 chown)
+COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY --chown=node:node ui/package.json ./ui/package.json
+COPY --chown=node:node patches ./patches
+COPY --chown=node:node scripts ./scripts
+
+# 6. 安装依赖 (此时 node_modules 自动属于 node 用户)
+# Use BuildKit cache mount to speed up pnpm installs
+RUN --mount=type=cache,id=pnpm-store,target=/home/node/.local/share/pnpm/store,uid=1000,gid=1000 \
+    pnpm install --frozen-lockfile
+
+# 7. 拷贝源码并构建
+COPY --chown=node:node . .
+
+# 执行构建，新生成的文件（dist 等）也会属于 node 用户
+RUN pnpm build
+ENV OPENCLAW_PREFER_PNPM=1
+RUN pnpm ui:build
+
+ENV NODE_ENV=production
+
+# 此时 /app 下的所有文件权限已经是正确的 node:node，无需再运行那个 100s 的 chown
+
+# 启动命令
+CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]

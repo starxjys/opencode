@@ -1,12 +1,27 @@
-import type { TUI } from "@mariozechner/pi-tui";
-import type { ChatLog } from "./components/chat-log.js";
-import type { AgentEvent, ChatEvent, TuiStateAccess } from "./tui-types.js";
 import { asString, extractTextFromMessage, isCommandMessage } from "./tui-formatters.js";
 import { TuiStreamAssembler } from "./tui-stream-assembler.js";
+import type { AgentEvent, ChatEvent, TuiStateAccess } from "./tui-types.js";
+
+type EventHandlerChatLog = {
+  startTool: (toolCallId: string, toolName: string, args: unknown) => void;
+  updateToolResult: (
+    toolCallId: string,
+    result: unknown,
+    options?: { partial?: boolean; isError?: boolean },
+  ) => void;
+  addSystem: (text: string) => void;
+  updateAssistant: (text: string, runId: string) => void;
+  finalizeAssistant: (text: string, runId: string) => void;
+  dropAssistant: (runId: string) => void;
+};
+
+type EventHandlerTui = {
+  requestRender: () => void;
+};
 
 type EventHandlerContext = {
-  chatLog: ChatLog;
-  tui: TUI;
+  chatLog: EventHandlerChatLog;
+  tui: EventHandlerTui;
   state: TuiStateAccess;
   setActivityStatus: (text: string) => void;
   refreshSessionInfo?: () => Promise<void>;
@@ -172,7 +187,13 @@ export function createEventHandlers(context: EventHandlerContext) {
           : "";
 
       const finalText = streamAssembler.finalize(evt.runId, evt.message, state.showThinking);
-      chatLog.finalizeAssistant(finalText, evt.runId);
+      const suppressEmptyExternalPlaceholder =
+        finalText === "(no output)" && !isLocalRunId?.(evt.runId);
+      if (suppressEmptyExternalPlaceholder) {
+        chatLog.dropAssistant(evt.runId);
+      } else {
+        chatLog.finalizeAssistant(finalText, evt.runId);
+      }
       noteFinalizedRun(evt.runId);
       clearActiveRunIfMatch(evt.runId);
       if (wasActiveRun) {

@@ -45,12 +45,35 @@ describe("model-selection", () => {
         provider: "anthropic",
         model: "claude-opus-4-6",
       });
+      expect(parseModelRef("anthropic/sonnet-4.6", "openai")).toEqual({
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      });
+      expect(parseModelRef("sonnet-4.6", "anthropic")).toEqual({
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      });
     });
 
     it("should use default provider if none specified", () => {
       expect(parseModelRef("claude-3-5-sonnet", "anthropic")).toEqual({
         provider: "anthropic",
         model: "claude-3-5-sonnet",
+      });
+    });
+
+    it("normalizes openai gpt-5.3 codex refs to openai-codex provider", () => {
+      expect(parseModelRef("openai/gpt-5.3-codex", "anthropic")).toEqual({
+        provider: "openai-codex",
+        model: "gpt-5.3-codex",
+      });
+      expect(parseModelRef("gpt-5.3-codex", "openai")).toEqual({
+        provider: "openai-codex",
+        model: "gpt-5.3-codex",
+      });
+      expect(parseModelRef("openai/gpt-5.3-codex-codex", "anthropic")).toEqual({
+        provider: "openai-codex",
+        model: "gpt-5.3-codex-codex",
       });
     });
 
@@ -127,7 +150,7 @@ describe("model-selection", () => {
       const cfg: Partial<OpenClawConfig> = {
         agents: {
           defaults: {
-            model: "claude-3-5-sonnet",
+            model: { primary: "claude-3-5-sonnet" },
           },
         },
       };

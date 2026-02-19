@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
+import http from "node:http";
+import net from "node:net";
 import { WebSocket, type ClientOptions, type CertMeta } from "ws";
+import {
+  clearDeviceAuthToken,
+  loadDeviceAuthToken,
+  storeDeviceAuthToken,
+} from "../infra/device-auth-store.js";
 import type { DeviceIdentity } from "../infra/device-identity.js";
-import { loadDeviceAuthToken, storeDeviceAuthToken } from "../infra/device-auth-store.js";
 import {
   loadOrCreateDeviceIdentity,
   publicKeyRawBase64UrlFromPem,
@@ -17,6 +23,7 @@ import {
   type GatewayClientName,
 } from "../utils/message-channel.js";
 import { buildDeviceAuthPayload } from "./device-auth.js";
+import { isSecureWebSocketUrl } from "./net.js";
 import {
   type ConnectParams,
   type EventFrame,
@@ -53,6 +60,8 @@ export type GatewayClientOptions = {
   permissions?: Record<string, boolean>;
   pathEnv?: string;
   deviceIdentity?: DeviceIdentity;
+  /** Skip device identity loading (for Unix socket connections) */
+  skipDeviceIdentity?: boolean;
   minProtocol?: number;
   maxProtocol?: number;
   tlsFingerprint?: string;
@@ -90,9 +99,13 @@ export class GatewayClient {
   private tickTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: GatewayClientOptions) {
+    // Don't auto-load deviceIdentity if skipDeviceIdentity is true (for Unix socket connections)
+    // or if deviceIdentity is explicitly provided
     this.opts = {
       ...opts,
-      deviceIdentity: opts.deviceIdentity ?? loadOrCreateDeviceIdentity(),
+      deviceIdentity: opts.skipDeviceIdentity
+        ? undefined
+        : opts.deviceIdentity ?? loadOrCreateDeviceIdentity(),
     };
   }
 
@@ -101,15 +114,69 @@ export class GatewayClient {
       return;
     }
     const url = this.opts.url ?? "ws://127.0.0.1:18789";
-    if (this.opts.tlsFingerprint && !url.startsWith("wss://")) {
+    
+    // Check for Unix socket URL
+    const isUnixSocket = url.startsWith("ws+unix://");
+    
+    if (this.opts.tlsFingerprint && !url.startsWith("wss://") && !isUnixSocket) {
       this.opts.onConnectError?.(new Error("gateway tls fingerprint requires wss:// gateway url"));
+      return;
+    }
+
+    // Security check: block ALL plaintext ws:// to non-loopback addresses (CWE-319, CVSS 9.8)
+    // This protects both credentials AND chat/conversation data from MITM attacks.
+    // Device tokens may be loaded later in sendConnect(), so we block regardless of hasCredentials.
+    if (!isSecureWebSocketUrl(url)) {
+      // Safe hostname extraction - avoid throwing on malformed URLs in error path
+      let displayHost = url;
+      try {
+        displayHost = new URL(url).hostname || url;
+      } catch {
+        // Use raw URL if parsing fails
+      }
+      const error = new Error(
+        `SECURITY ERROR: Cannot connect to "${displayHost}" over plaintext ws://. ` +
+          "Both credentials and chat data would be exposed to network interception. " +
+          "Use wss:// for the gateway URL, or connect via SSH tunnel to localhost.",
+      );
+      this.opts.onConnectError?.(error);
       return;
     }
     // Allow node screen snapshots and other large responses.
     const wsOptions: ClientOptions = {
       maxPayload: 25 * 1024 * 1024,
     };
-    if (url.startsWith("wss://") && this.opts.tlsFingerprint) {
+    
+    if (isUnixSocket) {
+      // For Unix socket, we need to use a custom agent
+      // The ws library doesn't directly support socketPath in ClientOptions
+      // We need to create an http.Agent with custom createConnection
+      const socketPath = url.replace("ws+unix://", "");
+      
+      // Create a custom agent that connects to Unix socket
+      const agent = new http.Agent({
+        keepAlive: true,
+      });
+      
+      // Override the createConnection method to use Unix socket
+      agent.createConnection = function (options, callback) {
+        const socket = net.connect(socketPath);
+        if (callback) {
+          socket.once("connect", () => callback(null, socket));
+          socket.once("error", (err: Error) => callback(err, socket));
+        }
+        return socket;
+      };
+      
+      const unixOptions = {
+        ...wsOptions,
+        agent,
+      };
+      
+      // Use ws:// with a dummy hostname
+      // The agent will handle the actual Unix socket connection
+      this.ws = new WebSocket("ws://localhost/", unixOptions);
+    } else if (url.startsWith("wss://") && this.opts.tlsFingerprint) {
       wsOptions.rejectUnauthorized = false;
       wsOptions.checkServerIdentity = ((_host: string, cert: CertMeta) => {
         const fingerprintValue =
@@ -132,11 +199,14 @@ export class GatewayClient {
         return undefined;
         // oxlint-disable-next-line typescript/no-explicit-any
       }) as any;
+      this.ws = new WebSocket(url, wsOptions);
+    } else {
+      // Regular TCP connection
+      this.ws = new WebSocket(url, wsOptions);
     }
-    this.ws = new WebSocket(url, wsOptions);
 
     this.ws.on("open", () => {
-      if (url.startsWith("wss://") && this.opts.tlsFingerprint) {
+      if (url.startsWith("wss://") && this.opts.tlsFingerprint && !isUnixSocket) {
         const tlsError = this.validateTlsFingerprint();
         if (tlsError) {
           this.opts.onConnectError?.(tlsError);
@@ -150,6 +220,24 @@ export class GatewayClient {
     this.ws.on("close", (code, reason) => {
       const reasonText = rawDataToString(reason);
       this.ws = null;
+      // If closed due to device token mismatch, clear the stored token so next attempt can get a fresh one
+      if (
+        code === 1008 &&
+        reasonText.toLowerCase().includes("device token mismatch") &&
+        this.opts.deviceIdentity
+      ) {
+        const role = this.opts.role ?? "operator";
+        try {
+          clearDeviceAuthToken({ deviceId: this.opts.deviceIdentity.deviceId, role });
+          logDebug(
+            `cleared stale device-auth token for device ${this.opts.deviceIdentity.deviceId}`,
+          );
+        } catch (err) {
+          logDebug(
+            `failed clearing stale device-auth token for device ${this.opts.deviceIdentity.deviceId}: ${String(err)}`,
+          );
+        }
+      }
       this.flushPendingErrors(new Error(`gateway closed (${code}): ${reasonText}`));
       this.scheduleReconnect();
       this.opts.onClose?.(code, reasonText);

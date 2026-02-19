@@ -1,5 +1,10 @@
 import type { Server as HttpServer } from "node:http";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { WebSocketServer } from "ws";
+import { CANVAS_HOST_PATH } from "../canvas-host/a2ui.js";
+import { type CanvasHostHandler, createCanvasHostHandler } from "../canvas-host/server.js";
 import type { CliDeps } from "../cli/deps.js";
 import type { createSubsystemLogger } from "../logging/subsystem.js";
 import type { PluginRegistry } from "../plugins/registry.js";
@@ -14,8 +19,13 @@ import type { GatewayTlsRuntime } from "./server/tls.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import { CANVAS_HOST_PATH } from "../canvas-host/a2ui.js";
 import { type CanvasHostHandler, createCanvasHostHandler } from "../canvas-host/server.js";
+import { resolveStateDir } from "../config/paths.js";
 import { resolveGatewayListenHosts } from "./net.js";
-import { createGatewayBroadcaster } from "./server-broadcast.js";
+import {
+  createGatewayBroadcaster,
+  type GatewayBroadcastFn,
+  type GatewayBroadcastToConnIdsFn,
+} from "./server-broadcast.js";
 import {
   type ChatRunEntry,
   createChatRunState,
@@ -23,9 +33,88 @@ import {
 } from "./server-chat.js";
 import { MAX_PAYLOAD_BYTES } from "./server-constants.js";
 import { attachGatewayUpgradeHandler, createGatewayHttpServer } from "./server-http.js";
+import type { DedupeEntry } from "./server-shared.js";
 import { createGatewayHooksRequestHandler } from "./server/hooks.js";
 import { listenGatewayHttpServer } from "./server/http-listen.js";
 import { createGatewayPluginRequestHandler } from "./server/plugins-http.js";
+
+/**
+ * Create a Unix domain socket server for local gateway access.
+ * Unix socket connections automatically skip device pairing when using valid credentials.
+ */
+async function createUnixSocketServer(params: {
+  socketPath: string;
+  wss: WebSocketServer;
+  canvasHost: CanvasHostHandler | null;
+  clients: Set<GatewayWsClient>;
+  resolvedAuth: ResolvedGatewayAuth;
+  rateLimiter?: AuthRateLimiter;
+  handleHooksRequest: ReturnType<typeof createGatewayHooksRequestHandler> | null;
+  handlePluginRequest: ReturnType<typeof createGatewayPluginRequestHandler>;
+  log: { info: (msg: string) => void; warn: (msg: string) => void };
+}): Promise<HttpServer | null> {
+  // Check Windows compatibility
+  if (process.platform === "win32") {
+    const winVersion = os.release();
+    const [major, , build] = winVersion.split(".").map(Number);
+    // Windows 10 1803 (build 17134) and later support Unix sockets
+    if (major < 10 || (major === 10 && build < 17134)) {
+      params.log.warn("unix socket not supported on this Windows version, skipping");
+      return null;
+    }
+  }
+
+  try {
+    // Clean up old socket file
+    await fs.unlink(params.socketPath).catch(() => {});
+
+    // Ensure directory exists
+    await fs.mkdir(path.dirname(params.socketPath), { recursive: true });
+
+    // Create HTTP server for Unix socket
+    const unixServer = createGatewayHttpServer({
+      canvasHost: params.canvasHost,
+      clients: params.clients,
+      controlUiEnabled: false, // Unix socket doesn't serve Control UI
+      controlUiBasePath: "",
+      openAiChatCompletionsEnabled: false,
+      openResponsesEnabled: false,
+      handleHooksRequest: params.handleHooksRequest,
+      handlePluginRequest: params.handlePluginRequest,
+      resolvedAuth: params.resolvedAuth,
+      rateLimiter: params.rateLimiter,
+      tlsOptions: undefined, // Unix socket doesn't need TLS
+    });
+
+    // Listen on Unix socket
+    await new Promise<void>((resolve, reject) => {
+      unixServer.once("error", reject);
+      unixServer.listen(params.socketPath, () => {
+        unixServer.removeListener("error", reject);
+        resolve();
+      });
+    });
+
+    // Set strict file permissions (owner read/write only)
+    await fs.chmod(params.socketPath, 0o600);
+
+    // Attach WebSocket upgrade handler
+    attachGatewayUpgradeHandler({
+      httpServer: unixServer,
+      wss: params.wss,
+      canvasHost: params.canvasHost,
+      clients: params.clients,
+      resolvedAuth: params.resolvedAuth,
+      rateLimiter: params.rateLimiter,
+    });
+
+    params.log.info(`gateway unix socket listening at ${params.socketPath}`);
+    return unixServer;
+  } catch (err) {
+    params.log.warn(`failed to create unix socket server: ${String(err)}`);
+    return null;
+  }
+}
 
 export async function createGatewayRuntimeState(params: {
   cfg: import("../config/config.js").OpenClawConfig;
@@ -58,23 +147,8 @@ export async function createGatewayRuntimeState(params: {
   httpBindHosts: string[];
   wss: WebSocketServer;
   clients: Set<GatewayWsClient>;
-  broadcast: (
-    event: string,
-    payload: unknown,
-    opts?: {
-      dropIfSlow?: boolean;
-      stateVersion?: { presence?: number; health?: number };
-    },
-  ) => void;
-  broadcastToConnIds: (
-    event: string,
-    payload: unknown,
-    connIds: ReadonlySet<string>,
-    opts?: {
-      dropIfSlow?: boolean;
-      stateVersion?: { presence?: number; health?: number };
-    },
-  ) => void;
+  broadcast: GatewayBroadcastFn;
+  broadcastToConnIds: GatewayBroadcastToConnIdsFn;
   agentRunSeq: Map<string, number>;
   dedupe: Map<string, DedupeEntry>;
   chatRunState: ReturnType<typeof createChatRunState>;
@@ -88,6 +162,7 @@ export async function createGatewayRuntimeState(params: {
   ) => ChatRunEntry | undefined;
   chatAbortControllers: Map<string, ChatAbortControllerEntry>;
   toolEventRecipients: ReturnType<typeof createToolEventRecipientRegistry>;
+  unixSocketPath?: string;
 }> {
   let canvasHost: CanvasHostHandler | null = null;
   if (params.canvasHostEnabled) {
@@ -193,6 +268,23 @@ export async function createGatewayRuntimeState(params: {
   const chatAbortControllers = new Map<string, ChatAbortControllerEntry>();
   const toolEventRecipients = createToolEventRecipientRegistry();
 
+  // Create Unix socket server for local access (skip pairing)
+  const unixSocketPath = path.join(params.deps.configDir ?? resolveStateDir(), "gateway.sock");
+  const unixServer = await createUnixSocketServer({
+    socketPath: unixSocketPath,
+    wss,
+    canvasHost,
+    clients,
+    resolvedAuth: params.resolvedAuth,
+    rateLimiter: params.rateLimiter,
+    handleHooksRequest,
+    handlePluginRequest,
+    log: params.log,
+  });
+  if (unixServer) {
+    httpServers.push(unixServer);
+  }
+
   return {
     canvasHost,
     httpServer,
@@ -211,5 +303,6 @@ export async function createGatewayRuntimeState(params: {
     removeChatRun,
     chatAbortControllers,
     toolEventRecipients,
+    unixSocketPath: unixServer ? unixSocketPath : undefined,
   };
 }

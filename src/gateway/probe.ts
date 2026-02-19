@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { SystemPresence } from "../infra/system-presence.js";
+import { resolveStateDir } from "../config/config.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import { GatewayClient } from "./client.js";
@@ -38,6 +41,27 @@ export async function probeGateway(opts: {
   let connectError: string | null = null;
   let close: GatewayProbeClose | null = null;
 
+  // Check if we should use Unix socket for local connections
+  // This allows probes to work in Docker environments without TCP access
+  let useUnixSocket = false;
+  let actualUrl = opts.url;
+  
+  // Only try Unix socket for local loopback URLs
+  if (opts.url.includes('127.0.0.1') || opts.url.includes('localhost')) {
+    try {
+      const configDir = resolveStateDir(process.env);
+      const socketPath = path.join(configDir, 'gateway.sock');
+      const stats = await fs.stat(socketPath);
+      
+      if (stats.isSocket()) {
+        useUnixSocket = true;
+        actualUrl = `ws+unix://${socketPath}`;
+      }
+    } catch {
+      // Unix socket not available, use TCP
+    }
+  }
+
   return await new Promise<GatewayProbeResult>((resolve) => {
     let settled = false;
     const settle = (result: Omit<GatewayProbeResult, "url">) => {
@@ -51,7 +75,7 @@ export async function probeGateway(opts: {
     };
 
     const client = new GatewayClient({
-      url: opts.url,
+      url: actualUrl,
       token: opts.auth?.token,
       password: opts.auth?.password,
       clientName: GATEWAY_CLIENT_NAMES.CLI,
